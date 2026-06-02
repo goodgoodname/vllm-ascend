@@ -1033,11 +1033,19 @@ class NPUModelRunner(GPUModelRunner):
             positions_full = np.empty(num_tokens_full, dtype=np.int64)
             np.add(base[req_indices_full], query_pos, out=positions_full)
 
-            self.pcp_manager.rebuild_draft_slot_mapping(
+            self.pcp_manager.generate_pcp_mtp_input(
+                num_tokens_full,
+                scheduler_output.num_scheduled_tokens,
+                with_prefill,
                 self.input_batch,
+                self.arange_np,
                 req_indices_full,
                 positions_full,
                 cu_num_tokens_full,
+                self._draft_token_ids,
+                scheduler_output,
+                self.num_spec_tokens,
+                fixed_positions_np=positions_full,
             )
 
         # In async spec decode mode, num_computed_tokens was corrected on GPU

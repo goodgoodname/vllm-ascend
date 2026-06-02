@@ -864,6 +864,7 @@ class PCPManager:
         draft_token_ids=None,
         scheduler_output=None,
         num_spec_tokens=None,
+        fixed_positions_np=None,
     ):
         """
         While pcp > 1, model inputs (input_ids, position, etc.) are split across pcp group,
@@ -884,7 +885,10 @@ class PCPManager:
         )
         arange_pcp_full = arange_np[:total_num_scheduled_tokens_pcp_full] - cumsums_offsets_pcp_full
         positions_pcp_full_np = self.positions_pcp_full_np[:total_num_scheduled_tokens_pcp_full]
-        np.add(input_batch.num_computed_tokens_cpu[req_indices_pcp_full], arange_pcp_full, out=positions_pcp_full_np)
+        if fixed_positions_np is None:
+            np.add(input_batch.num_computed_tokens_cpu[req_indices_pcp_full], arange_pcp_full, out=positions_pcp_full_np)
+        else:
+            np.copyto(positions_pcp_full_np, fixed_positions_np[:total_num_scheduled_tokens_pcp_full])
         token_indices_pcp_full = positions_pcp_full_np + req_indices_pcp_full * input_batch.token_ids_cpu.shape[1]
         torch.index_select(
             input_batch.token_ids_cpu_tensor.flatten(),
@@ -937,52 +941,6 @@ class PCPManager:
             mtp_slot_pad[unpad_mask] = mtp_slot_ori
             self.mtp_slot_pad = mtp_slot_pad.to(self.device, non_blocking=True)
 
-    def rebuild_draft_slot_mapping(
-        self,
-        input_batch,
-        req_indices,
-        positions_np,
-        cu_num_tokens,
-    ):
-        # Rebuild draft slot mapping from global positions.
-        num_scheduled_tokens_full = int(cu_num_tokens[-1])
-        num_extra_draft_slots = self.decode_threshold - 2
-        num_draft_slot = num_scheduled_tokens_full + self.num_reqs * num_extra_draft_slots
-        num_draft_slot_padded = num_draft_slot * self.pcp_world_size
-
-        req_indices_split = np.array_split(req_indices, cu_num_tokens)[: self.num_reqs]
-        positions_split = np.array_split(positions_np, cu_num_tokens)[: self.num_reqs]
-        for req_idx in range(self.num_reqs):
-            req_indices_split[req_idx] = np.append(
-                req_indices_split[req_idx],
-                np.repeat(req_indices_split[req_idx][-1], num_extra_draft_slots)
-            )
-            positions_split[req_idx] = np.append(
-                positions_split[req_idx],
-                np.arange(
-                    positions_split[req_idx][-1] + 1,
-                    positions_split[req_idx][-1] + num_extra_draft_slots + 1,
-                )
-            )
-        req_indices_draft = np.concatenate(req_indices_split)
-        positions_draft = np.concatenate(positions_split)
-
-        input_batch.block_table.compute_slot_mapping_draft(
-            req_indices_draft,
-            positions_draft,
-        )
-
-        slot_unpad = input_batch.block_table.block_tables[0].slot_mapping.cpu[:num_draft_slot]
-        unpad_mask = np.repeat(False, num_draft_slot_padded)
-        unpad_mask[:: self.pcp_world_size] = True
-
-        slot_pad = torch.full(
-            [num_draft_slot_padded],
-            -1,
-            dtype=torch.int32,
-        )
-        slot_pad[unpad_mask] = slot_unpad
-        self.mtp_slot_pad = slot_pad.to(self.device, non_blocking=True)
 
     def _update_input_ids_pcp_full_ids(
         self,
