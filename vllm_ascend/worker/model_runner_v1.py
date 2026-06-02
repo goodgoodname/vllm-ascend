@@ -1009,6 +1009,37 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        if (
+            self.use_cp
+            and self.use_async_spec_decode
+            and self.valid_sampled_token_count_gpu is not None
+            and prev_req_id_to_index
+            and self.decode_threshold > 2
+            and not with_prefill
+            and self.pcp_manager.draft_slot_rebuild_req_indices_full is not None
+        ):
+            # Async scheduling may correct num_computed_tokens after draft slots
+            # were first built. Rebuild only the draft slot mapping.
+            req_indices_full = self.pcp_manager.draft_slot_rebuild_req_indices_full
+            cu_num_tokens_full = self.pcp_manager.draft_slot_rebuild_cu_num_tokens_full
+            num_tokens_full = self.pcp_manager.draft_slot_rebuild_num_tokens_full
+
+            base = self.num_computed_tokens[:num_reqs].cpu().numpy()
+
+            token_counts = np.diff(np.concatenate(([0], cu_num_tokens_full)))
+            token_starts = np.repeat(cu_num_tokens_full - token_counts, token_counts)
+            query_pos = self.arange_np[:num_tokens_full] - token_starts
+
+            positions_full = np.empty(num_tokens_full, dtype=np.int64)
+            np.add(base[req_indices_full], query_pos, out=positions_full)
+
+            self.pcp_manager.rebuild_draft_slot_mapping(
+                self.input_batch,
+                req_indices_full,
+                positions_full,
+                cu_num_tokens_full,
+            )
+
         # In async spec decode mode, num_computed_tokens was corrected on GPU
         # by update_num_computed_tokens_for_batch_change, so seq_lens (GPU) is
         # correct but optimistic_seq_lens_cpu is stale (it assumed all drafts
@@ -2747,6 +2778,11 @@ class NPUModelRunner(GPUModelRunner):
         def _get_pcp_metadata(block_table_tensor):
             if not self.use_cp:
                 return None, block_table_tensor
+            
+            fixed_decode_seq_lens_cpu = None
+            if self.use_async_spec_decode:
+                fixed_decode_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
+
             return self.pcp_manager.generate_pcp_metadata(
                 num_tokens,
                 self.query_lens,
@@ -2755,6 +2791,7 @@ class NPUModelRunner(GPUModelRunner):
                 block_table_tensor,
                 num_reqs_padded,
                 num_reqs,
+                fixed_decode_seq_lens_cpu,
             )
 
         def _get_block_table_and_slot_mapping(kv_cache_gid: int, total_num_scheduled_tokens_compressed_list: list[int]):
