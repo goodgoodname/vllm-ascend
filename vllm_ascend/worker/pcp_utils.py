@@ -139,6 +139,12 @@ class PCPManager:
         self._local_num_scheduled_tokens: np.ndarray | None = None
         self._local_total_num_scheduled_tokens: int | None = None
 
+        # Full pre-PCP token layout used to rebuild draft slot mapping
+        # after async scheduling corrects num_computed_tokens.
+        self.draft_slot_rebuild_req_indices_full = None
+        self.draft_slot_rebuild_cu_num_tokens_full = None
+        self.draft_slot_rebuild_num_tokens_full = 0
+
     def _get_cumsum_and_arange(
         self,
         num_scheduled_tokens: np.ndarray,
@@ -895,6 +901,13 @@ class PCPManager:
         self.cu_num_tokens_pcp_full = cu_num_tokens_pcp_full
         # For mtpx, pre-allocate mtp slot_mapping here
         if self.decode_threshold > 2 and not with_prefill:
+            if self.use_async_scheduling:
+                # Save full pre-PCP layout so async scheduling can rebuild draft slots
+                # with corrected num_computed_tokens.
+                self.draft_slot_rebuild_req_indices_full = req_indices.copy()
+                self.draft_slot_rebuild_cu_num_tokens_full = cu_num_tokens.copy()
+                self.draft_slot_rebuild_num_tokens_full = total_num_scheduled_tokens
+
             num_tokens_ori = sum(list(num_scheduled_tokens.values()))
             num_tokens_mtp = num_tokens_ori + self.num_reqs * (self.decode_threshold - 2)
             num_tokens_mtp_pad = num_tokens_mtp * self.pcp_world_size
@@ -918,6 +931,53 @@ class PCPManager:
             mtp_slot_pad = torch.full([num_tokens_mtp_pad], -1, dtype=torch.int32)
             mtp_slot_pad[unpad_mask] = mtp_slot_ori
             self.mtp_slot_pad = mtp_slot_pad.to(self.device, non_blocking=True)
+
+    def rebuild_draft_slot_mapping(
+        self,
+        input_batch,
+        req_indices,
+        positions_np,
+        cu_num_tokens,
+    ):
+        # Rebuild draft slot mapping from global positions.
+        num_scheduled_tokens_full = int(cu_num_tokens[-1])
+        num_extra_draft_slots = self.decode_threshold - 2
+        num_draft_slot = num_scheduled_tokens_full + self.num_reqs * num_extra_draft_slots
+        num_draft_slot_padded = num_draft_slot * self.pcp_world_size
+
+        req_indices_split = np.array_split(req_indices, cu_num_tokens)[: self.num_reqs]
+        positions_split = np.array_split(positions_np, cu_num_tokens)[: self.num_reqs]
+        for req_idx in range(self.num_reqs):
+            req_indices_split[req_idx] = np.append(
+                req_indices_split[req_idx],
+                np.repeat(req_indices_split[req_idx][-1], num_extra_draft_slots)
+            )
+            positions_split[req_idx] = np.append(
+                positions_split[req_idx],
+                np.arange(
+                    positions_split[req_idx][-1] + 1,
+                    positions_split[req_idx][-1] + num_extra_draft_slots + 1,
+                )
+            )
+        req_indices_draft = np.concatenate(req_indices_split)
+        positions_draft = np.concatenate(positions_split)
+
+        input_batch.block_table.compute_slot_mapping_draft(
+            req_indices_draft,
+            positions_draft,
+        )
+
+        slot_unpad = input_batch.block_table.block_tables[0].slot_mapping.cpu[:num_draft_slot]
+        unpad_mask = np.repeat(False, num_draft_slot_padded)
+        unpad_mask[:: self.pcp_world_size] = True
+
+        slot_pad = torch.full(
+            [num_draft_slot_padded],
+            -1,
+            dtype=torch.int32,
+        )
+        slot_pad[unpad_mask] = slot_unpad
+        self.mtp_slot_pad = slot_pad.to(self.device, non_blocking=True)
 
     def _update_input_ids_pcp_full_ids(
         self,
@@ -1035,6 +1095,7 @@ class PCPManager:
         block_table_tensor: torch.Tensor,
         num_reqs_padded: int,
         num_reqs: int,
+        fixed_decode_seq_lens_cpu: np.ndarray | None = None,
     ):
         from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 
@@ -1047,10 +1108,13 @@ class PCPManager:
         ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
         if self.pcp_world_size * self.dcp_world_size > 1:
             assert num_scheduled_tokens is not None
-            decode_context_lens = (
-                input_batch.num_computed_tokens_cpu[: self.num_decode_reqs]
-                + num_scheduled_tokens[: self.num_decode_reqs]
-            )
+            if fixed_decode_seq_lens_cpu is not None:
+                decode_context_lens = fixed_decode_seq_lens_cpu[: self.num_decode_reqs]
+            else:
+                decode_context_lens = (
+                    input_batch.num_computed_tokens_cpu[: self.num_decode_reqs]
+                    + num_scheduled_tokens[: self.num_decode_reqs]
+                )
             prefill_context_lens = input_batch.num_computed_tokens_cpu[self.num_decode_reqs : self.num_reqs]
             context_lens = np.concatenate([decode_context_lens, prefill_context_lens])
             num_computed_tokens_of_pcp_dcp = torch.zeros(
