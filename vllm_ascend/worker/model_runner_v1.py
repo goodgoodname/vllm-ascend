@@ -1004,6 +1004,39 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_computed_tokens[req_indices_gpu].to(torch.int64)
                 + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
+            if (
+                self.use_cp
+                and self.use_async_spec_decode
+                and self.valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
+                and not with_prefill
+            ):
+                base = self.num_computed_tokens[:num_reqs].cpu().numpy()
+                np.add(
+                    base[req_indices],
+                    self.query_pos.np[:total_num_scheduled_tokens],
+                    out=positions_np,
+                )
+
+                token_indices = (
+                    positions_np[:total_num_scheduled_tokens]
+                    + req_indices * self.input_batch.token_ids_cpu.shape[1]
+                )
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    torch.from_numpy(token_indices),
+                    out=self.input_ids.cpu[:total_num_scheduled_tokens],
+                )
+
+                self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+                self._prepare_input_ids(
+                    scheduler_output,
+                    num_reqs,
+                    total_num_scheduled_tokens,
+                    cu_num_tokens,
+                )
+                logger.warning("[DCPDBG] rebuild input_ids")
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
