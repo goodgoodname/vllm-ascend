@@ -1034,14 +1034,29 @@ class NPUModelRunner(GPUModelRunner):
             and self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
-            and not with_prefill
         )
         corrected_num_computed_tokens_np = None
         if should_rebuild_async_inputs:
             # Async spec decode corrects num_computed_tokens on device.
-            # Copy once and reuse for CPU-side rebuilds in this iteration.
+            # Rebuild CPU-side inputs from the corrected positions.
             corrected_num_computed_tokens_np = (
                 self.num_computed_tokens[:num_reqs].cpu().numpy()
+            )
+            position_offsets = (
+                position_pcp
+                if self.pcp_size > 1
+                else self.query_pos.np
+            )
+
+            self._rebuild_input_ids_with_corrected_positions(
+                scheduler_output,
+                num_reqs,
+                total_num_scheduled_tokens,
+                req_indices,
+                position_offsets,
+                positions_np,
+                cu_num_tokens,
+                corrected_num_computed_tokens_np,
             )
 
         if self.pcp_size > 1:
@@ -1049,18 +1064,6 @@ class NPUModelRunner(GPUModelRunner):
             # special PCP offsets (position_pcp) that are only computed on CPU.
             # Copy the correctly-computed CPU positions to GPU instead of
             # recomputing on GPU (which would miss the PCP offsets).
-
-            if should_rebuild_async_inputs:
-                self._rebuild_input_ids_with_corrected_positions(
-                    scheduler_output,
-                    num_reqs,
-                    total_num_scheduled_tokens,
-                    req_indices,
-                    position_pcp,
-                    positions_np,
-                    cu_num_tokens,
-                    corrected_num_computed_tokens_np,
-                )
 
             self.positions[:total_num_scheduled_tokens].copy_(
                 torch.from_numpy(
@@ -1074,32 +1077,12 @@ class NPUModelRunner(GPUModelRunner):
                 + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
 
-            if should_rebuild_async_inputs:
-                self._rebuild_input_ids_with_corrected_positions(
-                    scheduler_output,
-                    num_reqs,
-                    total_num_scheduled_tokens,
-                    req_indices,
-                    self.query_pos.np,
-                    positions_np,
-                    cu_num_tokens,
-                    corrected_num_computed_tokens_np,
-                )
-
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        if (
-            self.use_cp
-            and self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-            and self.decode_threshold > 2
-            and not with_prefill
-            and self.pcp_manager.async_rebuild_req_indices_full is not None
-        ):
+        if should_rebuild_async_inputs:
             req_indices_full = self.pcp_manager.async_rebuild_req_indices_full
             cu_num_tokens_full = self.pcp_manager.async_rebuild_cu_num_tokens_full
             num_tokens_full = self.pcp_manager.async_rebuild_num_tokens_full

@@ -922,15 +922,16 @@ class PCPManager:
         self.query_start_loc_pcp_full.copy_to_gpu()
         self.input_ids_pcp_full.copy_to_gpu(total_num_scheduled_tokens_pcp_full)
         self.cu_num_tokens_pcp_full = cu_num_tokens_pcp_full
+
+        if self.use_async_scheduling and precomputed_positions_np is None:
+            # Save full pre-CP layout so async scheduling can rebuild
+            # speculative inputs with corrected num_computed_tokens.
+            self.async_rebuild_req_indices_full = req_indices.copy()
+            self.async_rebuild_cu_num_tokens_full = cu_num_tokens.copy()
+            self.async_rebuild_num_tokens_full = total_num_scheduled_tokens
+
         # For mtpx, pre-allocate mtp slot_mapping here
         if self.decode_threshold > 2 and not with_prefill:
-            if self.use_async_scheduling and precomputed_positions_np is None:
-                # Save full pre-PCP layout so async scheduling can rebuild draft slots
-                # with corrected num_computed_tokens.
-                self.async_rebuild_req_indices_full = req_indices.copy()
-                self.async_rebuild_cu_num_tokens_full = cu_num_tokens.copy()
-                self.async_rebuild_num_tokens_full = total_num_scheduled_tokens
-
             num_tokens_ori = sum(list(num_scheduled_tokens.values()))
             num_tokens_mtp = num_tokens_ori + self.num_reqs * (self.decode_threshold - 2)
             num_tokens_mtp_pad = num_tokens_mtp * self.pcp_world_size
