@@ -1264,8 +1264,16 @@ class PCPManager:
                 and num_scheduled_tokens is not None
             ):
                 # Extract decode request info from input_batch and num_scheduled_tokens
-                decode_num_computed_tokens = input_batch.num_computed_tokens_cpu[: self.num_decode_reqs].tolist()
                 decode_num_scheduled_tokens = num_scheduled_tokens[: self.num_decode_reqs]
+                if fixed_decode_seq_lens_cpu is not None:
+                    decode_num_computed_tokens = (
+                        fixed_decode_seq_lens_cpu[: self.num_decode_reqs]
+                        - decode_num_scheduled_tokens
+                    ).tolist()
+                else:
+                    decode_num_computed_tokens = input_batch.num_computed_tokens_cpu[
+                        : self.num_decode_reqs
+                    ].tolist()
 
                 dcp_mtp_attn_mask = self.generate_mtp_attention_mask_for_decode(
                     decode_num_computed_tokens, decode_num_scheduled_tokens

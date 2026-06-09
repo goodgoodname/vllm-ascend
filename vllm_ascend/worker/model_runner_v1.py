@@ -2487,8 +2487,8 @@ class NPUModelRunner(GPUModelRunner):
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
-        sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
+        sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
