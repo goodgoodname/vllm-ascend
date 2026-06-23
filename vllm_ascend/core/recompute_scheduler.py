@@ -23,6 +23,8 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
+import numpy as np
+
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_events import KVEventBatch
@@ -265,6 +267,27 @@ class RecomputeScheduler(Scheduler):
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    def _get_routed_experts(self, request: Request) -> np.ndarray | None:
+        if not self.vllm_config.model_config.enable_return_routed_experts:
+            return None
+
+        kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+        block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
+        num_tokens = request.num_tokens - 1
+
+        block_ids_array = np.array(block_ids, dtype=np.int32)
+        num_blocks = len(block_ids)
+        attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
+        block_size = attn_group.kv_cache_spec.block_size
+
+        block_offsets = np.arange(0, block_size)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_array.reshape((num_blocks, 1)) * block_size
+        ).flatten()[:num_tokens]
+
+        return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def schedule(self) -> RecomputeSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
