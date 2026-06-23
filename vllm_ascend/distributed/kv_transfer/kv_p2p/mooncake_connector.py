@@ -1646,6 +1646,15 @@ class MooncakeConnectorWorker:
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # 只有 decode/consumer 侧会接收远端 KV。
+        # prefill/producer 侧没有 remote KV load failure 要上报。
+        if self.kv_role == "kv_consumer" and self.kv_recv_thread is not None:
+            return self.kv_recv_thread.get_and_clear_invalid_block_ids()
+
+        # 没有失败，或者当前不是 consumer，就返回空集合。
+        return set()
+
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
